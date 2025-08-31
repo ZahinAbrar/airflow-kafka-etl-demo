@@ -1,0 +1,253 @@
+# Project Report — Airflow + Kafka ETL for NYC Taxi (Streaming + Batch)
+
+> **Interview one‑liner:** *“I built a streaming+batch ETL for NYC Taxi data: Bash ingests CSV → Kafka buffers events → Airflow orchestrates ingestion, data quality, Parquet partitioning, and a warehouse load. The pipeline achieves at‑least‑once delivery with idempotent upserts, daily compaction to Silver, and SLA monitoring.”*
+
+---
+
+## 1) Motivation
+Modern data products need **freshness + reliability**. Batch-only jobs lead to stale dashboards; streaming-only stacks are costly and brittle. This project shows a **practical hybrid**: use **Kafka** as a buffer for near‑real‑time ingest and **Airflow** for robust orchestration/backfills, with **Bronze→Silver→Gold** layers for governance and cost control.
+
+**Business-style motivation (what you say):**
+- “Decision teams need up‑to‑hour insights on trip volume/fare trends. I designed a pipeline that ingests continuously, validates, and prepares clean, queryable partitions every day.”
+
+---
+
+## 2) Goals (SMART)
+- **Freshness:** Land raw “Bronze” files within **≤60s** of ingest window.
+- **Reliability:** **≥99%** DAG success rate with retries/backoff.
+- **Quality:** Invalid-row rate **<0.5%**; quarantine with daily report.
+- **Performance:** Daily compaction to Parquet at **50k+ rows/sec** on laptop‑class hardware.
+- **Ops:** Backfills for any day via Airflow parameters; zero duplicate loads (idempotency).
+
+---
+
+## 3) Dataset
+**Source:** NYC TLC Trip Record Data (Yellow Taxi).
+
+**Fields used (subset):**
+- `vendor_id`, `pickup_datetime`, `dropoff_datetime`, `passenger_count`
+- `trip_distance`, `fare_amount`, `pickup_location_id`, `dropoff_location_id`
+
+**Why this dataset?**
+- Clean public schema, no PHI/PII → safe to demo.
+- Natural **time partition** (`pickup_date`) for compaction & pruning.
+
+**Usage in pipeline:**
+- **Stage** CSV → **NDJSON** (Bash/awk) for line‑delimited event production.
+- Produce each NDJSON line to **Kafka topic** `taxi.trips.v1` (keyed by `pickup_date`).
+- **Consume** to Bronze Parquet; **compact** daily to Silver partition `pickup_date=YYYY‑MM‑DD`.
+- **Load** to warehouse (SQLite/Postgres) as `fact_trips` (idempotent “overwrite partition”).
+
+---
+
+## 4) Architecture Overview
+
+```mermaid
+flowchart LR
+  subgraph Source
+    A[Hourly CSV / API]
+  end
+  subgraph Ingest (Shell)
+    B[fetch_csv.sh → NDJSON]
+  end
+  subgraph Kafka
+    K[(topic: taxi.trips.v1)]
+  end
+  subgraph Airflow
+    D1[consume_to_bronze.py] --> D2[compact_daily.py] --> D3[load_dw.py] --> D4[dq_checks]
+  end
+  subgraph Storage
+    S1[Bronze: raw Parquet] --> S2[Silver: partitioned Parquet] --> S3[Gold: Warehouse]
+  end
+  A --> B --> K --> D1 --> S1
+```
+
+**Key design choices (short bullets):**
+- **Kafka** for buffering, partitioning, replay; keys by `pickup_date`.
+- **Airflow** for dependency mgmt, retries, SLAs, backfills.
+- **Idempotency** at sink: delete/overwrite partition → “exactly-once effect”.
+- **Schema evolution ready**: start with JSON; Avro+Schema Registry next.
+
+---
+
+## 5) Pipeline Stages (How it works)
+1) **Ingest (Shell)** — `fetch_csv.sh`
+   - Converts CSV → NDJSON to produce line‑by‑line events.
+   - Fast, deterministic, infra‑agnostic (works on any box/CI).
+
+2) **Stream buffer (Kafka)** — `taxi.trips.v1`
+   - Partitions: default 3–6 (demo), key = `pickup_date` for affinity.
+   - Supports **consumer groups** & **replay** for backfills.
+
+3) **Bronze landing (Python Consumer)** — `consume_to_parquet.py`
+   - Reads from Kafka; writes Parquet batches with timestamps.
+   - At‑least‑once by design; dedupe handled at Silver/Gold.
+
+4) **Silver compaction (Daily)** — `compact_daily.py`
+   - Filters Bronze on `pickup_date`, writes to partitioned Parquet.
+   - Normalizes schema, enforces types, drops obvious outliers if configured.
+
+5) **Warehouse load (Gold)** — `load_dw.py`
+   - Idempotent: `DELETE FROM fact_trips WHERE pickup_date = :date` then insert.
+   - Ready for BI or downstream ML features.
+
+6) **Data Quality** — `dq_checks`
+   - Row-count reconciliation; null checks; numeric range checks.
+   - Quarantines failures + simple summary report.
+
+---
+
+## 6) Data Model
+**Gold layer:** `fact_trips`
+Columns: `trip_id (PK)`, `vendor_id`, `pickup_datetime`, `dropoff_datetime`, `passenger_count`, `trip_distance`, `fare_amount`, `pickup_location_id`, `dropoff_location_id`, `pickup_date`.
+
+**Why a single fact table?**
+- Keeps the demo lean. In production, add dims (`dim_vendor`, `dim_zone`) and SCD handling.
+
+---
+
+## 7) Delivery Semantics & Idempotency
+- **Ingest:** at‑least‑once (network or consumer retries may duplicate).
+- **Sink:** overwrite date partitions or use upsert keys (e.g., `(vendor_id, pickup_datetime, dropoff_datetime)`).
+- **Effect:** **exactly‑once at the warehouse**, which is what analytics consumers need.
+
+---
+
+## 8) Transformations & Quality Checks
+**Transforms (examples):**
+- Cast timestamps; derive `pickup_date`.
+- Clamp negative/implausible values: `trip_distance >= 0`, `fare_amount >= 0`.
+- Optional winsorization for extreme tails.
+
+**DQ checks (examples):**
+- **Counts:** Stage ≤ Bronze ≤ Silver ≤ Warehouse (non‑decreasing).
+- **Nulls:** `pickup_datetime`, `dropoff_datetime`, `pickup_location_id`, `dropoff_location_id` not null.
+- **Ranges:** `passenger_count ∈ [0,8]`; `trip_distance ∈ [0,100]` (configurable).
+
+**Quarantine:** Invalid rows written to a `/data/quarantine/` partition for review.
+
+---
+
+## 9) Orchestration & Backfills (Airflow)
+- **DAG:** `fetch_csv` → `produce_to_kafka` → `consume_to_bronze` → `compact_to_silver` → `load_dw` → `dq_checks`.
+- **Schedule:** `@hourly` (Bronze landing) + daily compaction to Silver.
+- **Retries:** `retries=2`, exponential backoff.
+- **Backfills:** trigger with `ds` parameter; consumer replay supported by Kafka offsets.
+- **SLAs:** on compaction & load tasks; alert on misses.
+
+---
+
+## 10) Ops, Monitoring, and Recovery
+- **Monitoring:** Airflow UI (task durations, retries, SLAs). (Optional: Prometheus/Grafana)
+- **Failures:** Poison messages → dead‑letter topic (`taxi.trips.dlq`) — *optional extension*.
+- **Reprocessing:** Replay from Kafka or re‑run compaction for a given date.
+- **Schema changes:** Start permissive (JSON), then enforce via Avro/Schema Registry.
+
+---
+
+## 11) Security & Compliance (demo‑level)
+- Secrets via **Airflow Connections/Variables** or environment variables.
+- No PHI/PII in dataset; **least privilege** on buckets/DB.
+- Auditability via partitioned data & Airflow logs.
+
+---
+
+## 12) Performance & Cost (indicative)
+- **Local laptop:** 50k+ rows/sec compaction to Parquet; minutes for daily partitions.
+- **Managed Kafka (dev tier):** a few dollars/month for light throughput.
+- **Optimization knobs:** more Kafka partitions, vectorized Parquet writes, partition pruning.
+
+---
+
+## 13) Limitations
+- Single‑node consumer in demo (scale via more partitions/consumers).
+- Schema enforcement minimal (JSON only).
+- Warehouse is SQLite for simplicity (swap to Postgres/BigQuery/Snowflake).
+
+---
+
+## 14) Future Work
+- Avro + **Schema Registry** (compatibility contracts).
+- **Delta/Iceberg** tables for ACID + time travel.
+- **Great Expectations** for declarative DQ and data docs.
+- CI/CD for DAGs; deploy to MWAA/Astronomer.
+- **Streaming aggregates** in Flink/Spark Structured Streaming.
+
+---
+
+## 15) Reproducibility & How to Run
+
+### A) Colab + Confluent Cloud (no Docker)
+- Use `notebooks/colab_kafka_etl_demo.ipynb`.
+- Create topic `taxi.trips.v1` and API key/secret in Confluent Cloud.
+- Fill `CONF` in the notebook; run all cells.
+
+### B) Local Docker Compose (full stack)
+- Bring up Zookeeper/Kafka/Airflow with `docker-compose up -d`.
+- Create topic; enable `nyc_taxi_pipeline` DAG in Airflow UI (`http://localhost:8080`).
+- Check `/data` mounts for Bronze/Silver outputs; verify `warehouse.db`.
+
+---
+
+## 16) Results (sample numbers to state)
+- **Freshness:** Bronze landing in **≤60 seconds** post‑ingest.
+- **Reliability:** **≥99%** DAG success; Airflow retries handle transient issues.
+- **Data quality:** < **0.5%** invalid rows quarantined.
+- **Backfills:** Single‑command backfill for any date via `ds` parameter.
+
+*(Replace with your actual numbers after first run.)*
+
+---
+
+## 17) Interview Q&A (cheat sheet)
+
+**Q: Why Kafka instead of direct S3 upload?**
+A: Kafka gives **back‑pressure**, **ordering within partitions**, and **replay** for backfills. It decouples ingest from downstream processing.
+
+**Q: Do you guarantee exactly-once?**
+A: End‑to‑end is at‑least‑once, but **idempotent partition overwrite** at the warehouse achieves **exactly‑once effect** for consumers.
+
+**Q: How do you handle late/duplicate events?**
+A: Compaction overwrites per day; dedupe keys `(vendor_id, pickup_datetime, dropoff_datetime)`. Late events re‑processed on next compaction.
+
+**Q: How would you scale?**
+A: Increase partitions; parallel consumers; batch sizes; switch compaction to Spark/Flink; use Delta/Iceberg for ACID & compaction.
+
+**Q: What would you add next?**
+A: Schema Registry, Great Expectations, and a CI/CD pipeline for Airflow DAGs; optional MWAA/Astronomer deployment.
+
+---
+
+## 18) Appendix
+
+### Table: Key Entities & Tasks
+| Layer | Artifact | Purpose |
+|---|---|---|
+| Source | CSV | Raw trip data |
+| Ingest | `fetch_csv.sh` | CSV→NDJSON for event production |
+| Kafka | `taxi.trips.v1` | Buffering, partitioning, replay |
+| Bronze | `trips_*.parquet` | Raw landed batches |
+| Silver | `pickup_date=YYYY-MM-DD/` | Clean, partitioned Parquet |
+| Gold | `fact_trips` | Warehouse table for BI/analytics |
+
+### Sample DDL
+```sql
+CREATE TABLE IF NOT EXISTS fact_trips(
+  trip_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  vendor_id TEXT,
+  pickup_datetime TEXT,
+  dropoff_datetime TEXT,
+  passenger_count INTEGER,
+  trip_distance REAL,
+  fare_amount REAL,
+  pickup_location_id INTEGER,
+  dropoff_location_id INTEGER,
+  pickup_date TEXT
+);
+```
+
+---
+
+**Author:** Abrar Zahin  
+**Repo name:** `airflow-kafka-etl-nyc-taxi`  
+**License:** MIT
