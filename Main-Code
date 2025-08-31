@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+set -euo pipefail
+DATE_HOUR="${1:?usage: fetch_csv.sh YYYY-MM-DD-HH}"
+OUT_DIR="data/stage/${DATE_HOUR}"
+mkdir -p "$OUT_DIR"
+
+# Example file (replace with your URL or local path)
+URL="https://s3.amazonaws.com/nyc-tlc/trip+data/yellow_tripdata_2024-01.parquet"
+
+# For demo simplicity, pretend we have a CSV (you can convert Parquet→CSV beforehand)
+# Here we just download once and keep a small sample CSV in repo for consistent demo:
+cp samples/yellow_sample.csv "${OUT_DIR}/trips.csv"
+
+# Clean: remove header & blanks, emit NDJSON line-by-line
+awk 'NR>1 && NF>0 {printf("{\"vendor_id\":\"%s\",\"pickup_datetime\":\"%s\",\"dropoff_datetime\":\"%s\",\"passenger_count\":%s,\"trip_distance\":%s,\"fare_amount\":%s,\"pickup_location_id\":%s,\"dropoff_location_id\":%s}\n", $1,$2,$3,$4,$5,$6,$7,$8)}' \
+  "${OUT_DIR}/trips.csv" > "${OUT_DIR}/trips.ndjson"
+
+echo "[fetch_csv] wrote ${OUT_DIR}/trips.ndjson"
+
+#!/usr/bin/env bash
+set -euo pipefail
+DATE_HOUR="${1:?usage: produce_to_kafka.sh YYYY-MM-DD-HH}"
+TOPIC="${2:-taxi.trips.v1}"
+FILE="data/stage/${DATE_HOUR}/trips.ndjson"
+
+if ! command -v kafka-console-producer >/dev/null; then
+  echo "kafka-console-producer not found on PATH"; exit 1
+fi
+
+echo "[produce_to_kafka] producing from $FILE to $TOPIC"
+kafka-console-producer \
+  --bootstrap-server localhost:9092 \
+  --topic "$TOPIC" < "$FILE"
+
+
+import json, os, sys, time
+from datetime import datetime
+from pathlib import Path
+from confluent_kafka import Consumer
+import pandas as pd
+
+topic = os.environ.get("TOPIC", "taxi.trips.v1")
+group = os.environ.get("GROUP_ID", "bronze-writer")
+out_dir = Path(os.environ.get("OUT_DIR", "data/bronze"))
+duration = int(os.environ.get("DURATION_SECONDS", "60"))
+
+conf = {"bootstrap.servers":"localhost:9092","group.id":group,"auto.offset.reset":"earliest","enable.auto.commit":True}
+c = Consumer(conf); c.subscribe([topic])
+
+buf = []
+t0 = time.time()
+while time.time() - t0 < duration:
+    msg = c.poll(1.0)
+    if msg is None: continue
+    if msg.error(): continue
+    try:
+        buf.append(json.loads(msg.value()))
+    except Exception:
+        pass
+c.close()
+
+if buf:
+    df = pd.DataFrame(buf)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    fp = out_dir / f"trips_{ts}.parquet"
+    df.to_parquet(fp, index=False)
+    print(f"[consume_to_parquet] wrote {fp} rows={len(df)}")
+else:
+    print("[consume_to_parquet] no messages read")
+
+import sys, os
+from pathlib import Path
+import pandas as pd
+
+bronze = Path("data/bronze")
+silver = Path("data/silver")
+silver.mkdir(parents=True, exist_ok=True)
+
+date = sys.argv[1]  # YYYY-MM-DD
+parts = list(bronze.glob("trips_*.parquet"))
+if not parts: 
+    print("[compact_daily] nothing to compact"); sys.exit(0)
+
+df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
+# basic cleanup & partition
+df["pickup_date"] = pd.to_datetime(df["pickup_datetime"]).dt.date.astype(str)
+daily = df[df["pickup_date"] == date]
+
+day_dir = silver / f"pickup_date={date}"
+day_dir.mkdir(parents=True, exist_ok=True)
+daily.to_parquet(day_dir / "part-0000.parquet", index=False)
+print(f"[compact_daily] {date}: rows={len(daily)} -> {day_dir}")
+
+
+import sqlite3, pandas as pd, sys, os
+from pathlib import Path
+
+date = sys.argv[1]
+day_dir = Path(f"data/silver/pickup_date={date}")
+files = list(day_dir.glob("*.parquet"))
+if not files: 
+    print("[load_dw] no silver files for", date); sys.exit(0)
+
+df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+con = sqlite3.connect("data/warehouse.db")
+cur = con.cursor()
+cur.execute("""CREATE TABLE IF NOT EXISTS fact_trips(
+  trip_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  vendor_id TEXT,
+  pickup_datetime TEXT,
+  dropoff_datetime TEXT,
+  passenger_count INTEGER,
+  trip_distance REAL,
+  fare_amount REAL,
+  pickup_location_id INTEGER,
+  dropoff_location_id INTEGER,
+  pickup_date TEXT
+);""")
+# idempotency: delete existing date partition then insert
+cur.execute("DELETE FROM fact_trips WHERE pickup_date = ?", (date,))
+con.commit()
+df.to_sql("fact_trips", con, if_exists="append", index=False)
+print(f"[load_dw] loaded {len(df)} rows for {date}")
+con.close()
+
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+from airflow.operators.python import PythonOperator
+import os, subprocess
+
+def run_consumer(**ctx):
+    os.environ["OUT_DIR"] = "data/bronze"
+    os.environ["DURATION_SECONDS"] = "30"
+    subprocess.check_call(["python","scripts/consume_to_parquet.py"])
+
+def dq_checks(**ctx):
+    # super-light DQ: ensure bronze/silver not empty
+    assert any(p.endswith(".parquet") for p in os.listdir("data/bronze")), "No bronze data"
+    assert os.path.exists("data/silver"), "No silver dir"
+
+default_args = {
+  "owner": "abrar",
+  "retries": 2,
+  "retry_delay": timedelta(minutes=2),
+}
+with DAG(
+    dag_id="nyc_taxi_pipeline",
+    start_date=datetime(2025, 1, 1),
+    schedule="@hourly",
+    default_args=default_args,
+    catchup=False,
+    sla_miss_callback=None
+) as dag:
+
+    ts = "{{ ts_nodash[:10] }}" # YYYYMMDDHH
+    ymd = "{{ ds }}"            # YYYY-MM-DD
+
+    fetch_csv = BashOperator(
+        task_id="fetch_csv",
+        bash_command=f"bash scripts/fetch_csv.sh {{ ts_nodash[:10] }}",
+    )
+
+    produce = BashOperator(
+        task_id="produce_to_kafka",
+        bash_command=f"bash scripts/produce_to_kafka.sh {{ ts_nodash[:10] }} taxi.trips.v1",
+    )
+
+    consume = PythonOperator(
+        task_id="consume_to_bronze",
+        python_callable=run_consumer,
+    )
+
+    compact = BashOperator(
+        task_id="compact_to_silver",
+        bash_command="python scripts/compact_daily.py {{ ds }}",
+        trigger_rule="all_success"
+    )
+
+    load_dw = BashOperator(
+        task_id="load_dw",
+        bash_command="python scripts/load_dw.py {{ ds }}"
+    )
+
+    dq = PythonOperator(
+        task_id="dq_checks",
+        python_callable=dq_checks
+    )
+
+    fetch_csv >> produce >> consume >> compact >> load_dw >> dq
