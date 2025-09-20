@@ -7,9 +7,6 @@
 
 Production-style **streaming + batch ETL** for NYC Taxi trips using **Apache Kafka** (stream buffer), **Apache Airflow** (orchestration), **Bash** (ingest), and **Python/SQL** (transform + load). Demonstrates **Bronze/Silver/Gold** data layers, **idempotent loads**, and **SLA-driven** pipelines.
 
-> **30‑sec pitch (interview)**: I built a streaming+batch pipeline where a Bash job ingests raw CSVs hourly, publishes events to Kafka, and Airflow orchestrates: ingest → quality checks → Parquet partitions (Silver) → warehouse (Gold). It runs at-least-once with idempotent upserts and schema evolution readiness. Freshness ≤ 60s for Bronze; nightly compaction to Silver; reliable DAGs (≥99% success).
-
----
 
 ## Table of Contents
 - [Architecture](#architecture)
