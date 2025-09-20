@@ -26,35 +26,6 @@ Production-style **streaming + batch ETL** for NYC Taxi trips using **Apache Kaf
 - [License](#license)
 
 ---
-
-## Architecture
-
-```mermaid
-flowchart LR
-  subgraph Source
-    A[Hourly CSV / API]
-  end
-
-  subgraph Ingest (Shell)
-    B[fetch_csv.sh → NDJSON]
-  end
-
-  subgraph Kafka
-    K[(topic: taxi.trips.v1)]
-  end
-
-  subgraph Airflow
-    D1[consume_to_bronze.py] --> D2[compact_daily.py]
-    D2 --> D3[load_dw.py]
-    D3 --> D4[dq_checks]
-  end
-
-  subgraph Storage
-    S1[Bronze: raw Parquet] --> S2[Silver: partitioned Parquet]
-    S2 --> S3[Gold: Warehouse (SQLite/Postgres)]
-  end
-
-  A --> B --> K --> D1 --> S1
 ```
 
 **Layers**
