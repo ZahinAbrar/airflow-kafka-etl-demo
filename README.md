@@ -57,7 +57,7 @@ Production-style **streaming + batch ETL** for NYC Taxi trips using **Apache Kaf
 
 ## Repository Layout
 
-```
+```bash
 etl-kafka-airflow/
 ├─ airflow/
 │  └─ dags/
